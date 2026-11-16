@@ -1,0 +1,160 @@
+{
+  "nodes": {
+    "disko": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789770686,
+        "narHash": "sha256-uZkBR7yHdIKUFB5SZdfgh1qkGfI3XmYmI/lTiquxbck=",
+        "owner": "nix-community",
+        "repo": "disko",
+        "rev": "725ea35e410ad83be4931d1bff7e090eacaf3563",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "disko",
+        "type": "github"
+      }
+    },
+    "flake-parts": {
+      "inputs": {
+        "nixpkgs-lib": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790898470,
+        "narHash": "sha256-zTwuwezD0w3hpga6a6P8emidzAZFyWqlNeRBlpWOOl8=",
+        "owner": "hercules-ci",
+        "repo": "flake-parts",
+        "rev": "024633cd702b10285db5cb19b40ad48d2399ba60",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hercules-ci",
+        "repo": "flake-parts",
+        "type": "github"
+      }
+    },
+    "gitleaks": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784739033,
+        "narHash": "sha256-oxBhPCFq9L0p1we4ewjoJtmcmEnNj9im8j6oXKZT6T0=",
+        "owner": "gitleaks",
+        "repo": "gitleaks",
+        "rev": "b58d3f102cf3a2c84cb7f923d05c25c9b1aed84b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "gitleaks",
+        "repo": "gitleaks",
+        "type": "github"
+      }
+    },
+    "home-manager": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791227480,
+        "narHash": "sha256-+lrD+sxc2RKUWXRBAcggn7uBCFeJgnV75jD/cz7gJRA=",
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "aa23f720d022187228bc264f759aef6b80233bcf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "type": "github"
+      }
+    },
+    "import-tree": {
+      "locked": {
+        "lastModified": 1788467110,
+        "narHash": "sha256-ljEMTXP/rH0tOvDzc9gzwww6KcHRPRnEHzd9lK48V7s=",
+        "owner": "vic",
+        "repo": "import-tree",
+        "rev": "eb1b52eaecc57f7c136d07ae8a93e724dfecac46",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vic",
+        "repo": "import-tree",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791179034,
+        "narHash": "sha256-Ni0LBydzaCi8oek12r4mVreuFHqYlM1eTD6SfiENKfw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "494ce7fd23ff6a5dff39e1fb11e9b6f2ac74bf25",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "preservation": {
+      "locked": {
+        "lastModified": 1757436102,
+        "narHash": "sha256-mMI9IanU+Xw+pVogD2oT0I2kTmvz2Un/Apc5+CwUpEY=",
+        "owner": "nix-community",
+        "repo": "preservation",
+        "rev": "93416f4614ad2dfed5b0dcf12f27e57d27a5ab11",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "preservation",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "disko": "disko",
+        "flake-parts": "flake-parts",
+        "gitleaks": "gitleaks",
+        "home-manager": "home-manager",
+        "import-tree": "import-tree",
+        "nixpkgs": "nixpkgs",
+        "preservation": "preservation",
+        "sops-nix": "sops-nix"
+      }
+    },
+    "sops-nix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791103873,
+        "narHash": "sha256-nFxM+pKoZ8LJAEnUXARyCaOAloWgaW9kZQOSjWzKcTE=",
+        "owner": "Mic92",
+        "repo": "sops-nix",
+        "rev": "dcd241ba97088c22569d1573286e1b9daad340c0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mic92",
+        "repo": "sops-nix",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
