@@ -1,0 +1,2468 @@
+diff --git a/crates/atuin-client/src/settings.rs b/crates/atuin-client/src/settings.rs
+index 226ea5f..e6225d0 100644
+--- a/crates/atuin-client/src/settings.rs
++++ b/crates/atuin-client/src/settings.rs
+@@ -474,7 +474,7 @@ pub enum KeyBindingConfig {
+ }
+
+ /// User-facing keymap configuration. Each mode maps key strings to bindings.
+-/// Keys present here override the defaults for that key; unmentioned keys keep defaults.
++/// A mode with a table uses only that table; modes without one keep the defaults (patched).
+ #[derive(Clone, Debug, Deserialize, Serialize, Default)]
+ pub struct KeymapConfig {
+     #[serde(default)]
+@@ -951,6 +951,10 @@ pub struct Ui {
+     /// Syntax highlight commands in the interactive search results.
+     #[serde(default = "Ui::default_syntax_highlight")]
+     pub syntax_highlight: bool,
++
++    /// Columns in the Ctrl-O details view; same format as `columns`.
++    #[serde(default = "Ui::default_details_columns")]
++    pub details_columns: Vec<UiColumn>,
+ }
+
+ impl Ui {
+@@ -962,6 +966,16 @@ impl Ui {
+         ]
+     }
+
++    fn default_details_columns() -> Vec<UiColumn> {
++        vec![
++            UiColumn::new(UiColumnType::Exit),
++            UiColumn::new(UiColumnType::Duration),
++            UiColumn::new(UiColumnType::Time),
++            UiColumn::new(UiColumnType::Directory),
++            UiColumn::new(UiColumnType::Command),
++        ]
++    }
++
+     fn default_syntax_highlight() -> bool {
+         true
+     }
+@@ -989,6 +1003,7 @@ impl Default for Ui {
+         Self {
+             columns: Self::default_columns(),
+             syntax_highlight: Self::default_syntax_highlight(),
++            details_columns: Self::default_details_columns(),
+         }
+     }
+ }
+diff --git a/crates/atuin/src/command/client/search.rs b/crates/atuin/src/command/client/search.rs
+index 60f5f9e..df323f5 100644
+--- a/crates/atuin/src/command/client/search.rs
++++ b/crates/atuin/src/command/client/search.rs
+@@ -24,6 +24,7 @@ mod inspector;
+ mod interactive;
+ pub mod keybindings;
+ mod syntax;
++mod vim;
+
+ use atuin_common::time::UtcOffsetSpec;
+
+diff --git a/crates/atuin/src/command/client/search/cursor.rs b/crates/atuin/src/command/client/search/cursor.rs
+index 4d29985..f0084ce 100644
+--- a/crates/atuin/src/command/client/search/cursor.rs
++++ b/crates/atuin/src/command/client/search/cursor.rs
+@@ -293,6 +293,12 @@ impl Cursor {
+     pub fn position(&self) -> usize {
+         self.index
+     }
++
++    /// Replace the text, with the cursor at character `pos` (vim normal mode, patched).
++    pub fn set(&mut self, source: String, pos: usize) {
++        self.index = source.char_indices().nth(pos).map_or(source.len(), |(i, _)| i);
++        self.source = source;
++    }
+ }
+
+ #[cfg(test)]
+diff --git a/crates/atuin/src/command/client/search/history_list.rs b/crates/atuin/src/command/client/search/history_list.rs
+index efa771a..94a63ad 100644
+--- a/crates/atuin/src/command/client/search/history_list.rs
++++ b/crates/atuin/src/command/client/search/history_list.rs
+@@ -157,18 +157,20 @@ impl<'a> HistoryList<'a> {
+         self
+     }
+
++    // Patched: the list scrolls only when the selection would leave it, keeping one row of
++    // context past it (vim's scrolloff=1). Upstream keeps up to 10 rows ahead of it, so in a
++    // short inline window every key scrolled the list instead of moving the selection.
+     fn get_items_bounds(&self, selected: usize, offset: usize, height: usize) -> (usize, usize) {
+-        let offset = offset.min(self.history.len().saturating_sub(1));
+-
+-        let max_scroll_space = height.min(10).min(self.history.len() - selected);
+-        if offset + height < selected + max_scroll_space {
+-            let end = selected + max_scroll_space;
+-            (end - height, end)
+-        } else if selected < offset {
+-            (selected, selected + height)
++        let context = usize::from(height > 2);
++        let start = if selected + context >= offset + height {
++            (selected + context + 1).saturating_sub(height)
++        } else if selected < offset + context {
++            selected.saturating_sub(context)
+         } else {
+-            (offset, offset + height)
+-        }
++            offset
++        };
++        let start = start.min(self.history.len().saturating_sub(height));
++        (start, start + height)
+     }
+ }
+
+diff --git a/crates/atuin/src/command/client/search/interactive.rs b/crates/atuin/src/command/client/search/interactive.rs
+index d67eff6..5ee39ac 100644
+--- a/crates/atuin/src/command/client/search/interactive.rs
++++ b/crates/atuin/src/command/client/search/interactive.rs
+@@ -3,15 +3,16 @@ use std::io::Read as _;
+ use std::io::{IsTerminal, Write, stdout};
+ use std::time::Duration;
+
+-use atuin_client::database::{Context, Sqlite, current_context};
++use atuin_client::database::{Context, DbSearchMode, OptFilters, Sqlite, current_context};
+ use atuin_client::history::store::HistoryStore;
+-use atuin_client::history::{History, HistoryId, HistoryStats};
++use atuin_client::history::{History, HistoryId, HistoryStats, all_user_author_filter};
+ use atuin_client::settings::{
+     CursorStyle, ExitMode, FilterMode, KeymapMode, PreviewStrategy, RequestedSearchMode,
+     SearchMode, Settings, UiColumn,
+ };
+ use atuin_common::shell::Shell;
+ use atuin_common::string::EscapeNonPrintablePosixExt as _;
++use atuin_common::time::{DurationExt, OffsetDateTimeExt};
+ use eyre::Result;
+ use futures_util::FutureExt;
+ use ratatui::backend::{CrosstermBackend, FromCrossterm};
+@@ -37,6 +38,7 @@ use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP
+ use super::cursor::Cursor;
+ use super::engines::{AnySearchEngine, SearchEngine, SearchState};
+ use super::history_list::{HistoryList, ListState};
++use super::vim::{self, Vim};
+ use crate::VERSION;
+ use crate::command::client::search::engines;
+ use crate::command::client::search::history_list::HistoryHighlighter;
+@@ -51,6 +53,7 @@ pub enum InputAction {
+     Copy(usize),
+     Delete(usize),
+     DeleteAllMatching(usize),
++    DeleteAllResults,
+     ReturnOriginal,
+     ReturnQuery,
+     Continue,
+@@ -85,6 +88,33 @@ impl InspectingState {
+     }
+ }
+
++/// Columns before the query on the search line: " G " (the rows' " ❯ " / " 1 " width).
++const QUERY_INDENT: u16 = 3;
++
++/// Lines under the list in the Ctrl-O details view.
++const DETAIL_LINES: u16 = 2;
++
++/// One-column filter-mode icon on the search line (git repo: the branch symbol, U+E0A0).
++fn filter_icon(mode: FilterMode) -> &'static str {
++    match mode {
++        FilterMode::Global => "G",
++        FilterMode::Host => "H",
++        FilterMode::Session | FilterMode::SessionPreload => "S",
++        FilterMode::Directory => "D",
++        FilterMode::Workspace => "\u{e0a0}",
++    }
++}
++
++/// Search mode as shown at the right of the search line when it isn't the configured one.
++fn search_mode_label(mode: SearchMode) -> &'static str {
++    match mode {
++        SearchMode::Prefix => "prefix",
++        SearchMode::FullText => "full text",
++        SearchMode::Fuzzy => "fuzzy",
++        SearchMode::DaemonFuzzy => "daemon fuzzy",
++    }
++}
++
+ pub fn to_compactness(f: &Frame, settings: &Settings) -> Compactness {
+     if match settings.style {
+         atuin_client::settings::Style::Auto => f.area().height < 14,
+@@ -153,6 +183,18 @@ pub struct State {
+     accept: bool,
+     keymap_mode: KeymapMode,
+     prefix: bool,
++    /// Shift-Del pressed once in delete mode: the next Shift-Del deletes, any other key cancels.
++    confirm_delete_all: bool,
++    /// Ctrl-O: rows with the details columns, and two stats lines under the list.
++    details: bool,
++    /// Vim normal mode: counts, operators, text objects, the register, undo.
++    vim: Vim,
++    /// The command the selection stays on while the view changes (filter, search mode,
++    /// context); let go when the selection moves or the query is edited.
++    follow: Option<String>,
++    /// Inside a context (Alt-C): the query to restore when leaving it, and the command the
++    /// context was opened from.
++    context_return: Option<(String, String)>,
+     current_cursor: Option<CursorStyle>,
+     tab_index: usize,
+     pending_vim_key: Option<char>,
+@@ -365,9 +407,11 @@ impl State {
+
+         // Take pending key before any immutable borrows of self
+         let pending = self.pending_vim_key.take();
++        // A half-typed vim command (count, operator, f's target …) takes the next key.
++        let vim_pending = self.keymap_mode == KeymapMode::VimNormal && self.vim.pending();
+
+         // If in prefix mode, try prefix keymap first (single keys only)
+-        let prefix_action = if self.prefix {
++        let prefix_action = if self.prefix && !vim_pending {
+             let ki = KeyInput::Single(single.clone());
+             self.keymaps.prefix.resolve(&ki, &ctx)
+         } else {
+@@ -376,7 +420,9 @@ impl State {
+
+         // The if-let/else-if chain here is clearer than map_or_else with nested closures.
+         #[allow(clippy::option_if_let_else)]
+-        let (action, new_pending) = if prefix_action.is_some() {
++        let (action, new_pending) = if vim_pending {
++            (None, None)
++        } else if prefix_action.is_some() {
+             (prefix_action, None)
+         } else {
+             // Use mode keymap (handles both single and multi-key sequences)
+@@ -414,11 +460,21 @@ impl State {
+         // --- Phase 2: Apply mutations ---
+         self.pending_vim_key = new_pending;
+
+-        // Reset prefix (before execute, so EnterPrefixMode can re-set it)
+-        self.prefix = false;
++        // Prefix (delete) mode is not reset here: it stays on until Ctrl-A or Esc toggles it
++        // off. A pending "delete all" confirmation lasts exactly one key.
++        let armed = std::mem::take(&mut self.confirm_delete_all);
+
+         if let Some(action) = action {
++            if action == Action::DeleteAllResults && !armed {
++                // The first Shift-Del only asks; the next key confirms (Shift-Del) or cancels.
++                self.confirm_delete_all = true;
++                return InputAction::Continue;
++            }
+             self.execute_action(&action, settings)
++        } else if self.keymap_mode == KeymapMode::VimNormal && self.tab_index == 0 {
++            // Vim normal mode: keys [keymap.vim-normal] doesn't bind are vim commands.
++            let step = self.vim.feed(&single, &mut self.search.input, &settings.word_chars);
++            self.vim_step(step, settings)
+         } else {
+             // No action matched. In insert-capable modes, insert the character.
+             if self.is_insert_mode() && !single.ctrl && !single.alt {
+@@ -436,6 +492,31 @@ impl State {
+         }
+     }
+
++    /// Carry out what the vim engine asked for.
++    fn vim_step(&mut self, step: vim::Step, settings: &Settings) -> InputAction {
++        match step {
++            vim::Step::Pending | vim::Step::Done => InputAction::Continue,
++            vim::Step::Insert => {
++                // the engine has taken the undo step for this insert already
++                self.set_keymap_cursor(settings, "vim_insert");
++                self.keymap_mode = KeymapMode::VimInsert;
++                InputAction::Continue
++            }
++            vim::Step::Run(action, n) => {
++                let mut result = InputAction::Continue;
++                for _ in 0..n {
++                    result = self.execute_action(&action, settings);
++                }
++                result
++            }
++            vim::Step::Row(row) => {
++                self.results_state.select(row.min(self.results_len.saturating_sub(1)));
++                self.inspecting_state.reset();
++                InputAction::Continue
++            }
++        }
++    }
++
+     fn scroll_down(&mut self, scroll_len: usize) {
+         let i = self.results_state.selected().saturating_sub(scroll_len);
+         self.inspecting_state.reset();
+@@ -514,6 +595,10 @@ impl State {
+                 self.search.input.remove_next_word(&settings.word_chars, settings.word_jump_mode);
+                 InputAction::Continue
+             }
++            Action::VimDeleteWordBefore => {
++                vim::delete_word_before(&mut self.search.input, &settings.word_chars);
++                InputAction::Continue
++            }
+             Action::DeleteToWordBoundary => {
+                 // ctrl-w: remove trailing whitespace, then delete to word boundary
+                 while matches!(self.search.input.back(), Some(c) if c.is_whitespace()) {}
+@@ -628,7 +713,14 @@ impl State {
+                 let top = self.results_state.offset();
+                 let visible = self.results_state.max_entries().min(self.results_len);
+                 let bottom = top + visible.saturating_sub(1);
+-                self.results_state.select(bottom.min(self.results_len.saturating_sub(1)));
++                // inverted lists run downwards: the screen's top row is the first one (one
++                // row in when the list goes on above it, as vim's H with scrolloff=1)
++                let row = if settings.invert {
++                    top + usize::from(top > 0 && visible > 2)
++                } else {
++                    bottom
++                };
++                self.results_state.select(row.min(self.results_len.saturating_sub(1)));
+                 self.inspecting_state.reset();
+                 InputAction::Continue
+             }
+@@ -644,7 +736,15 @@ impl State {
+             Action::ScrollToScreenBottom => {
+                 // L — jump to bottom of visible screen
+                 let top_visible = self.results_state.offset();
+-                self.results_state.select(top_visible);
++                let visible = self.results_state.max_entries().min(self.results_len);
++                let row = if settings.invert {
++                    // one row in when the list goes on below it (vim's L with scrolloff=1)
++                    let last = top_visible + visible.saturating_sub(1);
++                    last - usize::from(last + 1 < self.results_len && visible > 2)
++                } else {
++                    top_visible
++                };
++                self.results_state.select(row.min(self.results_len.saturating_sub(1)));
+                 self.inspecting_state.reset();
+                 InputAction::Continue
+             }
+@@ -673,6 +773,7 @@ impl State {
+             Action::Copy => InputAction::Copy(self.results_state.selected()),
+             Action::Delete => InputAction::Delete(self.results_state.selected()),
+             Action::DeleteAll => InputAction::DeleteAllMatching(self.results_state.selected()),
++            Action::DeleteAllResults => InputAction::DeleteAllResults,
+             Action::ReturnOriginal => InputAction::ReturnOriginal,
+             Action::ReturnQuery => InputAction::ReturnQuery,
+             Action::Exit => Self::handle_key_exit(settings),
+@@ -692,53 +793,64 @@ impl State {
+             }
+             Action::ClearContext => InputAction::SwitchContext(None),
+             Action::ToggleTab => {
+-                self.tab_index = (self.tab_index + 1) % TAB_TITLES.len();
++                // Ctrl-O: the details view inline, instead of switching to the inspector tab.
++                self.details = !self.details;
+                 InputAction::Continue
+             }
+
+             // -- Mode changes --
+             Action::VimEnterNormal => {
++                // as in vim: the cursor steps back onto the last typed character
++                self.search.input.left();
++                self.vim.insert_ended(&self.search.input);
+                 self.set_keymap_cursor(settings, "vim_normal");
+                 self.keymap_mode = KeymapMode::VimNormal;
+                 InputAction::Continue
+             }
+             Action::VimEnterInsert => {
++                self.vim.insert_started(&self.search.input);
+                 self.set_keymap_cursor(settings, "vim_insert");
+                 self.keymap_mode = KeymapMode::VimInsert;
+                 InputAction::Continue
+             }
+             Action::VimEnterInsertAfter => {
++                self.vim.insert_started(&self.search.input);
+                 self.search.input.right();
+                 self.set_keymap_cursor(settings, "vim_insert");
+                 self.keymap_mode = KeymapMode::VimInsert;
+                 InputAction::Continue
+             }
+             Action::VimEnterInsertAtStart => {
++                self.vim.insert_started(&self.search.input);
+                 self.search.input.start();
+                 self.set_keymap_cursor(settings, "vim_insert");
+                 self.keymap_mode = KeymapMode::VimInsert;
+                 InputAction::Continue
+             }
+             Action::VimEnterInsertAtEnd => {
++                self.vim.insert_started(&self.search.input);
+                 self.search.input.end();
+                 self.set_keymap_cursor(settings, "vim_insert");
+                 self.keymap_mode = KeymapMode::VimInsert;
+                 InputAction::Continue
+             }
+             Action::VimSearchInsert => {
++                self.vim.insert_started(&self.search.input);
+                 self.search.input.clear();
+                 self.set_keymap_cursor(settings, "vim_insert");
+                 self.keymap_mode = KeymapMode::VimInsert;
+                 InputAction::Continue
+             }
+             Action::VimChangeToEnd => {
++                self.vim.insert_started(&self.search.input);
+                 self.search.input.clear_to_end();
+                 self.set_keymap_cursor(settings, "vim_insert");
+                 self.keymap_mode = KeymapMode::VimInsert;
+                 InputAction::Continue
+             }
+             Action::EnterPrefixMode => {
+-                self.prefix = true;
++                // A toggle: its key again (or Esc, in the prefix keymap) turns delete mode off.
++                self.prefix = !self.prefix;
+                 InputAction::Continue
+             }
+
+@@ -867,15 +979,19 @@ impl State {
+             _ => 0,
+         };
+         let preview_width = area.width.saturating_sub(2);
+-        let preview_height = Self::calc_preview_height(
+-            settings,
+-            results,
+-            self.results_state.selected(),
+-            self.tab_index,
+-            compactness,
+-            border_size,
+-            preview_width,
+-        );
++        let preview_height = if self.details {
++            DETAIL_LINES
++        } else {
++            Self::calc_preview_height(
++                settings,
++                results,
++                self.results_state.selected(),
++                self.tab_index,
++                compactness,
++                border_size,
++                preview_width,
++            )
++        };
+
+         let show_help = settings.show_help && (compactness == Compactness::Full || area.height > 1);
+         let warnings = self.build_warnings(settings, theme);
+@@ -884,6 +1000,9 @@ impl State {
+         // This is an OR, as it seems more likely for someone to wish to override
+         // tabs unexpectedly being missed, than unexpectedly present.
+         let show_tabs = settings.show_tabs && !matches!(compactness, Compactness::Ultracompact);
++        // Inverted: the list takes only the rows it fills, so the details lines follow the
++        // last result instead of sitting at the bottom of the window.
++        let list_rows = u16::try_from(results.len()).unwrap_or(u16::MAX).max(1);
+         let chunks = Layout::default()
+             .direction(Direction::Vertical)
+             .margin(0)
+@@ -892,7 +1011,7 @@ impl State {
+                 if invert {
+                     [
+                         Constraint::Length(1 + border_size), // input
+-                        Constraint::Min(1),                  // results list
++                        Constraint::Max(list_rows),          // results list
+                         Constraint::Length(preview_height),  // preview
+                         Constraint::Length(if show_tabs {
+                             1
+@@ -1025,7 +1144,7 @@ impl State {
+                     format!("{}> ", self.search.filter_mode.as_str().chars().next().unwrap())
+                 }
+             }
+-            _ => " > ".to_string(),
++            _ => " ❯ ".to_string(),
+         };
+
+         match self.tab_index {
+@@ -1045,7 +1164,11 @@ impl State {
+                     history_highlighter,
+                     settings.show_numeric_shortcuts,
+                     settings.ui.syntax_highlight,
+-                    &settings.ui.columns,
++                    if self.details {
++                        &settings.ui.details_columns
++                    } else {
++                        &settings.ui.columns
++                    },
+                 );
+                 f.render_stateful_widget(results_list, results_list_chunk, &mut self.results_state);
+             }
+@@ -1098,13 +1221,22 @@ impl State {
+                 Compactness::Full => preview_width - 2,
+                 _ => preview_width,
+             };
+-            let preview = self.build_preview(
+-                results,
+-                compactness,
+-                preview_width,
+-                preview_chunk.width.into(),
+-                theme,
+-            );
++            let preview = if self.details {
++                Self::build_details(
++                    results,
++                    self.results_state.selected(),
++                    stats.as_ref(),
++                    settings,
++                )
++            } else {
++                self.build_preview(
++                    results,
++                    compactness,
++                    preview_width,
++                    preview_chunk.width.into(),
++                    theme,
++                )
++            };
+             #[allow(clippy::cast_possible_truncation)]
+             let prefix_width = settings
+                 .ui
+@@ -1124,6 +1256,7 @@ impl State {
+                 preview_chunk,
+                 preview,
+                 std::cmp::max(prefix_width, min_prefix_width),
++                settings.active_search_mode(),
+             );
+         }
+     }
+@@ -1138,8 +1271,9 @@ impl State {
+         preview_chunk: Rect,
+         preview: Paragraph,
+         prefix_width: u16,
++        default_mode: SearchMode,
+     ) {
+-        let input = self.build_input(style, prefix_width);
++        let input = self.build_input(style, prefix_width, default_mode);
+         f.render_widget(input, input_chunk);
+
+         f.render_widget(preview, preview_chunk);
+@@ -1152,7 +1286,7 @@ impl State {
+         };
+         f.set_cursor_position((
+             // Put cursor past the end of the input text
+-            input_chunk.x + extra_width as u16 + prefix_width + cursor_offset,
++            input_chunk.x + extra_width as u16 + QUERY_INDENT + cursor_offset,
+             input_chunk.y + cursor_offset,
+         ));
+     }
+@@ -1305,22 +1439,103 @@ impl State {
+         }
+     }
+
+-    fn build_input(&self, style: StyleState, prefix_width: u16) -> Paragraph<'_> {
+-        let (pref, mode) = if self.prefix {
+-            ("", "PREFIX")
+-        } else if self.switched_search_mode {
+-            (" SRCH:", self.search_mode_state.raw_mode().as_str())
++    /// Ctrl-O details under the list: the selected command's stats, then the commands run
++    /// just before and after it in that session (the inspector's data, on two lines).
++    fn build_details(
++        results: &[History],
++        selected: usize,
++        stats: Option<&HistoryStats>,
++        settings: &Settings,
++    ) -> Paragraph<'static> {
++        let Some(h) = results.get(selected) else {
++            return Paragraph::new("");
++        };
++        let one_line = |s: &str| s.replace('\n', " ");
++        let mut facts = Vec::new();
++        if let Some(s) = stats {
++            let runs = if s.total == 1 {
++                "run"
++            } else {
++                "runs"
++            };
++            facts.push(format!("{} {runs}", s.total));
++            let avg = Duration::from_nanos(s.average_duration).display().largest_unit();
++            facts.push(format!("avg {avg}"));
++            let exits: Vec<String> =
++                s.exits.iter().map(|(code, n)| format!("{code}\u{d7}{n}")).collect();
++            facts.push(format!("exit {}", exits.join(" ")));
++        }
++        facts.push(h.timestamp.to_offset(settings.timezone.0).display().ymd_hm().to_string());
++        let neighbour = |entry: Option<&History>| {
++            entry.map_or_else(|| "\u{2014}".to_string(), |e| one_line(&e.command))
++        };
++        let before = neighbour(stats.and_then(|s| s.previous.as_ref()));
++        let after = neighbour(stats.and_then(|s| s.next.as_ref()));
++        let dim = Style::default().add_modifier(Modifier::DIM);
++        Paragraph::new(vec![
++            Line::styled(format!(" {}", facts.join(" \u{b7} ")), dim),
++            Line::styled(format!(" before: {before}   after: {after}"), dim),
++        ])
++    }
++
++    fn build_input(
++        &self,
++        style: StyleState,
++        _prefix_width: u16, // width of the [ MODE ] badge this layout replaces
++        default_mode: SearchMode,
++    ) -> Paragraph<'_> {
++        let filter = filter_icon(self.search.filter_mode);
++        // Marker column: a red trash can in delete mode (Ctrl-A), else the filter's icon.
++        let (icon, icon_style) = if self.prefix {
++            ("\u{f1f8}", Style::default().fg(Color::Red))
++        } else {
++            (filter, Style::default())
++        };
++        // Display results are capped at 200 rows; "all" deletes every match regardless.
++        let count = if self.results_len >= 200 {
++            "200+".to_string()
++        } else {
++            self.results_len.to_string()
++        };
++        // Right-hand label, only for a state other than the plain default one.
++        let label = if self.confirm_delete_all {
++            format!("delete all {count}? Shift-Del again")
++        } else if self.prefix {
++            format!("Del this \u{b7} Shift-Del all {count} \u{b7} {filter}")
+         } else if self.search.custom_context.is_some() {
+-            (" CTX:", self.search.filter_mode.as_str())
++            "context".to_string()
++        } else if self.search_mode_state.raw_mode() != default_mode {
++            search_mode_label(self.search_mode()).to_string()
++        } else {
++            String::new()
++        };
++        // Vim normal mode shows itself, or the keys of a pending command (2d, f, ci …).
++        let vim = if self.keymap_mode != KeymapMode::VimNormal {
++            ""
++        } else if self.vim.pending() {
++            self.vim.showcmd()
+         } else {
+-            ("", self.search.filter_mode.as_str())
++            "normal"
+         };
+-        // 3: surrounding "[" "] "
+-        let mode_width = usize::from(prefix_width) - pref.len() - 3;
+-        // sanity check to ensure we don't exceed the layout limits
+-        debug_assert!(mode_width >= mode.len(), "mode name '{mode}' is too long!");
+-        let input = format!("[{pref}{mode:^mode_width$}] {}", self.search.input.as_str());
+-        let input = Paragraph::new(input);
++        let label = match (label.is_empty(), vim.is_empty()) {
++            (_, true) => label,
++            (true, false) => vim.to_string(),
++            (false, false) => format!("{label} \u{b7} {vim}"),
++        };
++        let label_style = if self.confirm_delete_all {
++            Style::default().fg(Color::Red)
++        } else {
++            Style::default().add_modifier(Modifier::DIM)
++        };
++        let query = self.search.input.as_str();
++        let used = usize::from(QUERY_INDENT) + query.width() + label.width() + 1;
++        let input = Paragraph::new(Line::from(vec![
++            Span::raw(" "),
++            Span::styled(icon, icon_style),
++            Span::raw(format!(" {query}")),
++            Span::raw(" ".repeat(style.inner_width.saturating_sub(used).max(1))),
++            Span::styled(label, label_style),
++        ]));
+         match style.compactness {
+             Compactness::Full => {
+                 if style.invert {
+@@ -1594,6 +1809,34 @@ struct Stdout {
+     writer: TerminalWriter,
+     inline_mode: bool,
+     no_mouse: bool,
++    /// While `draw_frame` runs: the frame's output, sent in one write at its end.
++    frame: FrameBuffer,
++}
++
++type FrameBuffer = std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>;
++
++/// Draw one frame (patched). ratatui writes the changed cells and shows the cursor in one
++/// flush, then moves it back to the query in another: in between, the terminal showed the
++/// cursor where the last changed cell was (the ❯ row) and none at the query. The frame is
++/// now collected and sent at once, inside a synchronized update (terminals that support it
++/// show the whole frame at once), the cursor hidden until the frame shows it at the query.
++fn draw_frame<F: FnOnce(&mut Frame)>(
++    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
++    frame: &FrameBuffer,
++    render: F,
++) -> std::io::Result<()> {
++    if let Ok(mut buffer) = frame.lock() {
++        *buffer = Some(Vec::new());
++    }
++    let drawn = terminal.draw(render).map(|_| ());
++    let collected = frame.lock().ok().and_then(|mut buffer| buffer.take()).unwrap_or_default();
++    let mut out = Vec::with_capacity(collected.len() + 24);
++    out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
++    out.extend_from_slice(&collected);
++    out.extend_from_slice(b"\x1b[?2026l");
++    let backend = terminal.backend_mut();
++    let sent = backend.write_all(&out).and_then(|()| Write::flush(backend));
++    drawn.and(sent)
+ }
+
+ impl Stdout {
+@@ -1626,6 +1869,7 @@ impl Stdout {
+             writer,
+             inline_mode,
+             no_mouse,
++            frame: FrameBuffer::default(),
+         })
+     }
+ }
+@@ -1661,10 +1905,20 @@ impl Drop for Stdout {
+
+ impl Write for Stdout {
+     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        // during draw_frame: collected, and sent in one write at its end
++        if let Ok(mut frame) = self.frame.lock()
++            && let Some(frame) = frame.as_mut()
++        {
++            frame.extend_from_slice(buf);
++            return Ok(buf.len());
++        }
+         self.writer.write(buf)
+     }
+
+     fn flush(&mut self) -> std::io::Result<()> {
++        if self.frame.lock().is_ok_and(|frame| frame.is_some()) {
++            return Ok(());
++        }
+         self.writer.flush()
+     }
+ }
+@@ -1779,6 +2033,7 @@ pub async fn history(
+     let popup_mode = saved_screen.is_some();
+
+     let stdout = Stdout::new(inline_height > 0, settings.no_mouse)?;
++    let frame = stdout.frame.clone();
+
+     // In popup mode, clear the popup region on the physical terminal before
+     // ratatui takes over. Ratatui's diff-based rendering compares against an
+@@ -1885,11 +2140,19 @@ pub async fn history(
+             Box::new(OffsetDateTime::now_utc)
+         },
+         prefix: false,
++        confirm_delete_all: false,
++        details: false,
++        vim: Vim::default(),
++        follow: None,
++        context_return: None,
+         pending_vim_key: None,
+         original_input_empty: original_query.is_empty(),
+     };
+
+     app.initialize_keymap_cursor(settings);
++    if app.keymap_mode == KeymapMode::VimInsert {
++        app.vim.insert_started(&app.search.input);
++    }
+
+     if inline_height > 0 && !popup_mode {
+         terminal.clear()?;
+@@ -1898,7 +2161,7 @@ pub async fn history(
+     // Paint the UI before running the first search: on a cold start the query can
+     // block for a while (cold database pages, sleeping daemon), and the user should
+     // see the search UI immediately rather than a frozen terminal.
+-    terminal.draw(|f| {
++    draw_frame(&mut terminal, &frame, |f| {
+         app.draw(f, &[], None, None, settings, theme, popup_mode);
+     })?;
+
+@@ -1911,7 +2174,7 @@ pub async fn history(
+     let mut inspecting: Option<History> = None;
+     let accept;
+     let result = 'render: loop {
+-        terminal.draw(|f| {
++        draw_frame(&mut terminal, &frame, |f| {
+             app.draw(f, &results, stats.clone(), inspecting.as_ref(), settings, theme, popup_mode);
+         })?;
+
+@@ -1919,6 +2182,7 @@ pub async fn history(
+         let initial_filter_mode = app.search.filter_mode;
+         let initial_search_mode = app.search_mode();
+         let initial_custom_context = app.search.custom_context.clone();
++        let initial_selected = app.results_state.selected();
+
+         let event_ready = tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(250)));
+
+@@ -1969,12 +2233,59 @@ pub async fn history(
+                                 history_store.build_all(&db, &ids).await?;
+
+                                 app.results_len = results.len();
++                                // The selection stays in place: the next command moves into it.
++                                app.results_state.select(index.min(results.len().saturating_sub(1)));
++                                app.follow = None;
++                                app.inspecting_state.reset();
++                                app.tab_index = 0;
++                            },
++                            InputAction::DeleteAllResults => {
++                                // Every command the search lists (all of them, not only the 200
++                                // loaded for display), each with every run of it.
++                                let mode = match app.search_mode() {
++                                    SearchMode::Prefix => DbSearchMode::Prefix,
++                                    SearchMode::FullText => DbSearchMode::FullText,
++                                    SearchMode::Fuzzy | SearchMode::DaemonFuzzy => DbSearchMode::Fuzzy,
++                                };
++                                let shells = app.search.shells.to_filter();
++                                let listed = db
++                                    .search(mode, app.search.filter_mode, &app.search.context,
++                                        app.search.input.as_str(), OptFilters {
++                                            authors: all_user_author_filter(),
++                                            shells: shells.as_filter(),
++                                            ..Default::default()
++                                        })
++                                    .await
++                                    .unwrap_or_default();
++                                let mut entries = Vec::new();
++                                for listed_entry in &listed {
++                                    entries.extend(db.query_history(
++                                        &format!(
++                                            "select {} from history where command = '{}' and deleted_at is null",
++                                            atuin_client::database::HISTORY_COLUMNS,
++                                            listed_entry.command.replace('\'', "''")
++                                        )
++                                    ).await?);
++                                }
++
++                                let ids = history_store.delete_entries(entries).await?;
++                                history_store.build_all(&db, &ids).await?;
++
++                                results.clear();
++                                app.results_len = 0;
+                                 app.results_state = ListState::default();
+                                 app.inspecting_state.reset();
+                                 app.tab_index = 0;
+                             },
+                             InputAction::SwitchContext(index) => {
+                                 if let Some(index) = index && let Some(entry) = results.get(index) {
++                                    // Alt-C again restores this query (the context clears it).
++                                    if app.search.custom_context.is_none() {
++                                        app.context_return = Some((
++                                            app.search.input.as_str().to_owned(),
++                                            entry.command.clone(),
++                                        ));
++                                    }
+                                     app.search.custom_context = Some(entry.id.clone());
+                                     app.search.context = Context::from_history(entry);
+                                     app.search.filter_mode = FilterMode::Session;
+@@ -1984,13 +2295,17 @@ pub async fn history(
+                                     app.search.custom_context = None;
+                                     app.search.context = initial_context.clone();
+                                     app.search.filter_mode = default_filter_mode;
++                                    if let Some((query, _)) = &app.context_return {
++                                        app.search.input = Cursor::from(query.clone());
++                                        app.search.input.end();
++                                    }
+                                 }
+                             },
+                             InputAction::Redraw => {
+                                 if !popup_mode {
+                                     terminal.clear()?;
+                                 }
+-                                terminal.draw(|f| {
++                                draw_frame(&mut terminal, &frame, |f| {
+                                     app.draw(f, &results, stats.clone(), inspecting.as_ref(), settings, theme, popup_mode);
+                                 })?;
+                             },
+@@ -2015,24 +2330,45 @@ pub async fn history(
+             }
+         }
+
+-        if initial_input != app.search.input.as_str()
++        // A view change (filter, search mode, context) keeps the selection on its command.
++        // Cycling filters or modes keeps following it through views that don't list it;
++        // entering or leaving a context takes the command selected now. Moving the selection
++        // or editing the query lets go of it.
++        let context_changed = initial_custom_context != app.search.custom_context;
++        let view_changed = context_changed
+             || initial_filter_mode != app.search.filter_mode
+-            || initial_search_mode != app.search_mode()
+-            || initial_custom_context != app.search.custom_context
+-        {
++            || initial_search_mode != app.search_mode();
++        let input_changed = initial_input != app.search.input.as_str();
++        if view_changed {
++            if app.follow.is_none() || context_changed {
++                app.follow = results.get(initial_selected).map(|entry| entry.command.clone());
++            }
++        } else if input_changed || app.results_state.selected() != initial_selected {
++            app.follow = None;
++        }
++
++        if view_changed || input_changed {
+             results = app.query_results(&mut db, settings).await?;
+         }
+
+-        // In custom context mode, when no filter is applied, highlight the entry which was used
+-        // to enter the context when changing modes. This helps to find your way around.
+-        if app.search.custom_context.is_some()
+-            && app.search.input.as_str().is_empty()
+-            && (initial_custom_context != app.search.custom_context
+-                || initial_filter_mode != app.search.filter_mode)
+-            && let Some(history_id) = app.search.custom_context.clone()
+-            && let Some(pos) = results.iter().position(|entry| entry.id == history_id)
+-        {
+-            app.results_state.select(pos);
++        if view_changed {
++            // Leaving a context: if the command isn't in the restored list, the one the
++            // context was opened from.
++            let left_context =
++                initial_custom_context.is_some() && app.search.custom_context.is_none();
++            let opened_from = if left_context {
++                app.context_return.take().map(|(_, command)| command)
++            } else {
++                None
++            };
++            let position =
++                |command: &String| results.iter().position(|entry| &entry.command == command);
++            if let Some(row) = app.follow.as_ref().and_then(position) {
++                app.results_state.select(row);
++            } else if let Some(row) = opened_from.as_ref().and_then(position) {
++                app.results_state.select(row);
++                app.follow = opened_from;
++            }
+         }
+
+         let inspecting_id = app.inspecting_state.clone().current;
+@@ -2048,16 +2384,13 @@ pub async fn history(
+             }
+         }
+
+-        stats = if app.tab_index == 0 {
++        stats = if !app.details {
+             stats_for = None;
+             None
+         } else if !results.is_empty() {
+-            // If we have stats, then we can indicate next available IDs. This avoids passing
+-            // around a database object, or a full stats object.
+-            let selected = match inspecting.clone() {
+-                Some(insp) => insp,
+-                None => results[app.results_state.selected()].clone(),
+-            };
++            // Stats for the selected row: the details view follows the selection (the
++            // inspector tab, which could pin another entry, is no longer reachable).
++            let selected = results[app.results_state.selected().min(results.len() - 1)].clone();
+             if stats_for.as_ref() == Some(&selected.id) {
+                 // Already computed for this entry - the render loop iterates on every
+                 // input event and poll timeout, and stats() is several queries.
+@@ -2153,6 +2486,7 @@ pub async fn history(
+         | InputAction::Redraw
+         | InputAction::Delete(_)
+         | InputAction::DeleteAllMatching(_)
++        | InputAction::DeleteAllResults
+         | InputAction::SwitchContext(_) => {
+             unreachable!("should have been handled!")
+         }
+@@ -2225,6 +2559,11 @@ mod tests {
+             accept: false,
+             keymap_mode,
+             prefix: false,
++            confirm_delete_all: false,
++            details: false,
++            vim: super::Vim::default(),
++            follow: None,
++            context_return: None,
+             current_cursor: None,
+             tab_index: 0,
+             pending_vim_key: None,
+@@ -2595,11 +2934,12 @@ mod tests {
+     fn execute_toggle_tab(#[with(KeymapMode::Emacs, 100, 0)] mut state: State, settings: Settings) {
+         use crate::command::client::search::keybindings::Action;
+
+-        assert_eq!(state.tab_index, 0);
++        assert!(!state.details);
+         let _ = state.execute_action(&Action::ToggleTab, &settings);
+-        assert_eq!(state.tab_index, 1);
++        assert!(state.details, "ctrl-o shows the details view");
++        assert_eq!(state.tab_index, 0, "the inspector tab is never opened");
+         let _ = state.execute_action(&Action::ToggleTab, &settings);
+-        assert_eq!(state.tab_index, 0);
++        assert!(!state.details, "ctrl-o again hides it");
+     }
+
+     #[rstest]
+@@ -2615,7 +2955,7 @@ mod tests {
+     }
+
+     #[rstest]
+-    fn prefix_chord_ctrl_a_c_switches_context(
++    fn delete_mode_persists_and_types(
+         #[with(KeymapMode::Emacs, 100, 7)] mut state: State,
+         settings: Settings,
+     ) {
+@@ -2624,13 +2964,65 @@ mod tests {
+         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+         let result = state.handle_key_input(&settings, &ctrl_a);
+         assert!(matches!(result, super::InputAction::Continue));
+-        assert!(state.prefix, "ctrl-a should enter prefix mode");
++        assert!(state.prefix, "ctrl-a should enter delete mode");
+
+         let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+-        let result = state.handle_key_input(&settings, &c);
++        let _ = state.handle_key_input(&settings, &c);
++        assert_eq!(state.search.input.as_str(), "c", "letters still type in delete mode");
++        assert!(state.prefix, "delete mode stays on while typing");
++
++        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
++        let result = state.handle_key_input(&settings, &esc);
++        assert!(matches!(result, super::InputAction::Continue), "esc must not close the search");
++        assert!(!state.prefix, "esc leaves delete mode");
++
++        let _ = state.handle_key_input(&settings, &ctrl_a);
++        let _ = state.handle_key_input(&settings, &ctrl_a);
++        assert!(!state.prefix, "ctrl-a again leaves delete mode");
++    }
++
++    #[rstest]
++    fn delete_mode_keys(#[with(KeymapMode::Emacs, 100, 7)] mut state: State, settings: Settings) {
++        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++
++        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
++        let del = KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
++        let shift_del = KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT);
++        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
++        let _ = state.handle_key_input(&settings, &ctrl_a);
++
++        let result = state.handle_key_input(&settings, &del);
++        assert!(
++            matches!(result, super::InputAction::DeleteAllMatching(7)),
++            "del deletes this command"
++        );
++        assert!(state.prefix, "delete mode stays on after deleting");
++
++        let result = state.handle_key_input(&settings, &shift_del);
++        assert!(matches!(result, super::InputAction::Continue), "first shift-del only asks");
++        assert!(state.confirm_delete_all);
++        let result = state.handle_key_input(&settings, &shift_del);
++        assert!(matches!(result, super::InputAction::DeleteAllResults), "second shift-del deletes");
++        assert!(!state.confirm_delete_all);
++
++        let _ = state.handle_key_input(&settings, &shift_del);
++        let result = state.handle_key_input(&settings, &x);
++        assert!(matches!(result, super::InputAction::Continue));
++        assert!(!state.confirm_delete_all, "any other key cancels the confirmation");
++    }
++
++    #[rstest]
++    fn alt_c_switches_context(
++        #[with(KeymapMode::Emacs, 100, 7)] mut state: State,
++        settings: Settings,
++    ) {
++        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++
++        let alt_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
++        let result = state.handle_key_input(&settings, &alt_c);
+         assert!(
+             matches!(result, super::InputAction::SwitchContext(Some(7))),
+-            "prefix + c should switch context"
++            "alt-c should switch context"
+         );
+         assert_eq!(state.search.input.as_str(), "", "c should not be inserted");
+     }
+@@ -2644,15 +3036,11 @@ mod tests {
+
+         state.tab_index = 1;
+
+-        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+-        let _ = state.handle_key_input(&settings, &ctrl_a);
+-        assert!(state.prefix, "ctrl-a should enter prefix mode in inspector");
+-
+-        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+-        let result = state.handle_key_input(&settings, &c);
++        let alt_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
++        let result = state.handle_key_input(&settings, &alt_c);
+         assert!(
+             matches!(result, super::InputAction::SwitchContext(Some(7))),
+-            "prefix + c should switch context in inspector"
++            "alt-c should switch context in inspector"
+         );
+     }
+
+diff --git a/crates/atuin/src/command/client/search/keybindings/actions.rs b/crates/atuin/src/command/client/search/keybindings/actions.rs
+index 9cc1546..ade36b2 100644
+--- a/crates/atuin/src/command/client/search/keybindings/actions.rs
++++ b/crates/atuin/src/command/client/search/keybindings/actions.rs
+@@ -47,6 +47,7 @@ pub enum Action {
+     Copy,
+     Delete,
+     DeleteAll,
++    DeleteAllResults,
+     ReturnOriginal,
+     ReturnQuery,
+     Exit,
+@@ -65,6 +66,8 @@ pub enum Action {
+     VimEnterInsertAtEnd,
+     VimSearchInsert,
+     VimChangeToEnd,
++    /// Insert-mode Ctrl-W with vim's word classes (patched).
++    VimDeleteWordBefore,
+     EnterPrefixMode,
+
+     // Inspector
+@@ -127,6 +130,7 @@ impl Action {
+             "copy" => Ok(Action::Copy),
+             "delete" => Ok(Action::Delete),
+             "delete-all" => Ok(Action::DeleteAll),
++            "delete-all-results" => Ok(Action::DeleteAllResults),
+             "return-original" => Ok(Action::ReturnOriginal),
+             "return-query" => Ok(Action::ReturnQuery),
+             "exit" => Ok(Action::Exit),
+@@ -144,6 +148,7 @@ impl Action {
+             "vim-enter-insert-at-end" => Ok(Action::VimEnterInsertAtEnd),
+             "vim-search-insert" => Ok(Action::VimSearchInsert),
+             "vim-change-to-end" => Ok(Action::VimChangeToEnd),
++            "vim-delete-word-before" => Ok(Action::VimDeleteWordBefore),
+             "enter-prefix-mode" => Ok(Action::EnterPrefixMode),
+
+             "inspect-previous" => Ok(Action::InspectPrevious),
+@@ -194,6 +199,7 @@ impl Action {
+             Action::Copy => "copy".to_string(),
+             Action::Delete => "delete".to_string(),
+             Action::DeleteAll => "delete-all".to_string(),
++            Action::DeleteAllResults => "delete-all-results".to_string(),
+             Action::ReturnOriginal => "return-original".to_string(),
+             Action::ReturnQuery => "return-query".to_string(),
+             Action::Exit => "exit".to_string(),
+@@ -211,6 +217,7 @@ impl Action {
+             Action::VimEnterInsertAtEnd => "vim-enter-insert-at-end".to_string(),
+             Action::VimSearchInsert => "vim-search-insert".to_string(),
+             Action::VimChangeToEnd => "vim-change-to-end".to_string(),
++            Action::VimDeleteWordBefore => "vim-delete-word-before".to_string(),
+             Action::EnterPrefixMode => "enter-prefix-mode".to_string(),
+
+             Action::InspectPrevious => "inspect-previous".to_string(),
+diff --git a/crates/atuin/src/command/client/search/keybindings/defaults.rs b/crates/atuin/src/command/client/search/keybindings/defaults.rs
+index a455f4b..b0d870b 100644
+--- a/crates/atuin/src/command/client/search/keybindings/defaults.rs
++++ b/crates/atuin/src/command/client/search/keybindings/defaults.rs
+@@ -70,6 +70,12 @@ fn add_common_bindings(km: &mut Keymap) {
+
+     // Tab: always returns selection without executing (unlike Enter which respects enter_accept)
+     km.bind(key("tab"), Action::ReturnSelection);
++
++    // Alt-C: context view (the commands run around the selected one); again: back.
++    km.bind_conditional(key("alt-c"), vec![
++        KeyRule::when(ConditionAtom::HasContext, Action::ClearContext),
++        KeyRule::always(Action::SwitchContext),
++    ]);
+ }
+
+ /// Returns `Accept` or `ReturnSelection` based on the `enter_accept` setting.
+@@ -346,6 +352,10 @@ pub fn default_inspector_keymap(settings: &Settings) -> Keymap {
+     km.bind(key("ctrl-["), Action::Exit);
+     km.bind(key("tab"), Action::ReturnSelection);
+     km.bind(key("ctrl-o"), Action::ToggleTab);
++    km.bind_conditional(key("alt-c"), vec![
++        KeyRule::when(ConditionAtom::HasContext, Action::ClearContext),
++        KeyRule::always(Action::SwitchContext),
++    ]);
+
+     // Prefix key: ctrl-<prefix_char> → enter prefix mode
+     let prefix_char = settings.keys.prefix.chars().next().unwrap_or('a');
+@@ -381,17 +391,14 @@ pub fn default_inspector_keymap(settings: &Settings) -> Keymap {
+ // Prefix keymap
+ // ---------------------------------------------------------------------------
+
+-/// Build the default prefix keymap (active after ctrl-a prefix).
++/// Build the default prefix keymap: delete mode, on from ctrl-a until ctrl-a or esc.
++/// Only non-letter keys, so typing still edits the query while the mode is on.
+ pub fn default_prefix_keymap() -> Keymap {
+     let mut km = Keymap::new();
+
+-    km.bind(key("d"), Action::Delete);
+-    km.bind(key("D"), Action::DeleteAll);
+-    km.bind(key("a"), Action::CursorStart);
+-    km.bind_conditional(key("c"), vec![
+-        KeyRule::when(ConditionAtom::HasContext, Action::ClearContext),
+-        KeyRule::always(Action::SwitchContext),
+-    ]);
++    km.bind(key("delete"), Action::DeleteAll); // the selected command, every run of it
++    km.bind(key("shift-delete"), Action::DeleteAllResults); // every listed command (confirmed)
++    km.bind(key("esc"), Action::EnterPrefixMode); // toggles the mode off
+
+     km
+ }
+@@ -469,8 +476,8 @@ impl KeymapSet {
+     ///
+     /// Precedence rules:
+     /// - If `[keymap]` has any entries, `[keys]` is **ignored entirely**.
+-    ///   Defaults are built with standard `[keys]` values, then `[keymap]`
+-    ///   overrides are applied per-key.
++    ///   Defaults are built with standard `[keys]` values; a mode with a `[keymap]`
++    ///   table then uses only that table (patched).
+     /// - If `[keymap]` is empty/absent, `[keys]` customizes the defaults
+     ///   (current behavior for backward compatibility).
+     pub fn from_settings(settings: &Settings) -> Self {
+@@ -489,14 +496,23 @@ impl KeymapSet {
+         }
+     }
+
+-    /// Apply user keymap config overrides to all modes.
++    /// Apply the user's `[keymap]` tables. Patched: a mode with a table uses only that table
++    /// (its complete keymap: in vim normal mode, unbound keys go to the vim engine, and a
++    /// leftover default would shadow it); modes without one keep the defaults.
+     fn apply_config(&mut self, settings: &Settings) {
+         let config = &settings.keymap;
+-        apply_config_to_keymap(&mut self.emacs, &config.emacs);
+-        apply_config_to_keymap(&mut self.vim_normal, &config.vim_normal);
+-        apply_config_to_keymap(&mut self.vim_insert, &config.vim_insert);
+-        apply_config_to_keymap(&mut self.inspector, &config.inspector);
+-        apply_config_to_keymap(&mut self.prefix, &config.prefix);
++        for (keymap, table) in [
++            (&mut self.emacs, &config.emacs),
++            (&mut self.vim_normal, &config.vim_normal),
++            (&mut self.vim_insert, &config.vim_insert),
++            (&mut self.inspector, &config.inspector),
++            (&mut self.prefix, &config.prefix),
++        ] {
++            if !table.is_empty() {
++                *keymap = Keymap::new();
++            }
++            apply_config_to_keymap(keymap, table);
++        }
+     }
+ }
+
+@@ -676,9 +692,10 @@ mod tests {
+     // -- Prefix keymap tests --
+
+     #[rstest]
+-    #[case::d_deletes("d", 0, 0, 0, 10, Some(Action::Delete))]
+-    #[case::a_cursor_start("a", 0, 0, 0, 10, Some(Action::CursorStart))]
+-    #[case::unknown_key_returns_none("x", 0, 0, 0, 10, None)]
++    #[case::del_deletes_command("delete", 0, 0, 0, 10, Some(Action::DeleteAll))]
++    #[case::shift_del_deletes_results("shift-delete", 0, 0, 0, 10, Some(Action::DeleteAllResults))]
++    #[case::esc_leaves_mode("esc", 0, 0, 0, 10, Some(Action::EnterPrefixMode))]
++    #[case::letters_type("d", 0, 0, 0, 10, None)]
+     fn prefix_keymap_resolves(
+         #[case] k: &str,
+         #[case] cursor: usize,
+@@ -705,7 +722,7 @@ mod tests {
+         assert!(set.vim_normal.resolve(&key("ctrl-c"), &ctx).is_some());
+         assert!(set.vim_insert.resolve(&key("ctrl-c"), &ctx).is_some());
+         assert!(set.inspector.resolve(&key("ctrl-c"), &ctx).is_some());
+-        assert!(set.prefix.resolve(&key("d"), &ctx).is_some());
++        assert!(set.prefix.resolve(&key("delete"), &ctx).is_some());
+     }
+
+     // -- Settings-dependent behavior --
+@@ -820,23 +837,23 @@ mod tests {
+     }
+
+     #[test]
+-    fn config_override_preserves_unoverridden_keys() {
++    fn config_table_replaces_the_modes_keymap() {
+         use std::collections::HashMap;
+
+         use atuin_client::settings::KeyBindingConfig;
+
+         let mut settings = default_settings();
+-        // Override only ctrl-c; enter should keep its default
++        // A table for emacs with only ctrl-c: emacs has no other keys
+         settings.keymap.emacs =
+             HashMap::from([("ctrl-c".to_string(), KeyBindingConfig::Simple("exit".to_string()))]);
+
+         let set = KeymapSet::from_settings(&settings);
+         let ctx = make_ctx(0, 0, 0, 10);
+
+-        // ctrl-c overridden
+         assert_eq!(set.emacs.resolve(&key("ctrl-c"), &ctx), Some(Action::Exit));
+-        // enter still has default (enter_accept=false → ReturnSelection)
+-        assert_eq!(set.emacs.resolve(&key("enter"), &ctx), Some(Action::ReturnSelection));
++        assert_eq!(set.emacs.resolve(&key("enter"), &ctx), None);
++        // modes without a table keep their defaults (enter_accept=false → ReturnSelection)
++        assert_eq!(set.vim_insert.resolve(&key("enter"), &ctx), Some(Action::ReturnSelection));
+     }
+
+     #[test]
+@@ -914,7 +931,7 @@ mod tests {
+
+         // With [keymap] present (even just one override), [keys] is ignored
+         // so the standard defaults (scroll_exits=true) apply
+-        settings.keymap.emacs =
++        settings.keymap.vim_normal =
+             HashMap::from([("ctrl-c".to_string(), KeyBindingConfig::Simple("exit".to_string()))]);
+         let set_keymap = KeymapSet::from_settings(&settings);
+
+@@ -952,7 +969,7 @@ mod tests {
+         );
+
+         // Add a [keymap] entry (for a different key)
+-        settings.keymap.emacs =
++        settings.keymap.vim_normal =
+             HashMap::from([("ctrl-c".to_string(), KeyBindingConfig::Simple("exit".to_string()))]);
+         let set_keymap = KeymapSet::from_settings(&settings);
+
+diff --git a/crates/atuin/src/command/client/search/vim.rs b/crates/atuin/src/command/client/search/vim.rs
+new file mode 100644
+index 0000000..1b47825
+--- /dev/null
++++ b/crates/atuin/src/command/client/search/vim.rs
+@@ -0,0 +1,1187 @@
++//! Vim normal mode for the one-line search query (patched in).
++//!
++//! Counts, the `d` `c` `y` operators with motions and text objects, `f F t T` with `; ,`,
++//! `x X s S r ~ D C Y p P`, undo `u` and redo Ctrl-R, `i a I A /`. List keys (`j k gg G H M L`,
++//! Ctrl-U/D/B/F/N/P) come back as atuin actions, so they take a count too. The search UI
++//! hands a key here when `[keymap.vim-normal]` doesn't bind it, or while a command is pending.
++//! Words are runs of `word_chars` (vim's 'iskeyword'), runs of other non-blanks, or blanks.
++
++use super::cursor::Cursor;
++use super::keybindings::Action;
++use super::keybindings::key::{KeyCodeValue, SingleKey};
++
++/// What the search UI does after a key.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Step {
++    /// The command needs more keys (a count, an operator's motion, `f`'s target …).
++    Pending,
++    /// Finished (the query or the cursor may have changed); normal mode stays.
++    Done,
++    /// Switch to insert mode.
++    Insert,
++    /// Run this atuin action `n` times (list movement).
++    Run(Action, usize),
++    /// Select result row `n`, 0-based (`5G`).
++    Row(usize),
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Op {
++    Delete,
++    Change,
++    Yank,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Find {
++    Forward,      // f
++    Backward,     // F
++    TillForward,  // t
++    TillBackward, // T
++}
++
++impl Find {
++    fn reversed(self) -> Self {
++        match self {
++            Self::Forward => Self::Backward,
++            Self::Backward => Self::Forward,
++            Self::TillForward => Self::TillBackward,
++            Self::TillBackward => Self::TillForward,
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++enum Wait {
++    #[default]
++    Command,
++    /// `f F t T`: the character to find.
++    Target(Find),
++    /// `r`: the replacement character.
++    Replace,
++    /// `i` / `a` after an operator: the text object.
++    Object {
++        inner: bool,
++    },
++    /// `g`: `gg`, `ge`, `gE`.
++    G,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Motion {
++    Left,
++    Right,
++    LineStart,
++    FirstNonBlank,
++    LineEnd,
++    Column,
++    WordStart {
++        big: bool,
++    },
++    WordBack {
++        big: bool,
++    },
++    WordEnd {
++        big: bool,
++    },
++    WordEndBack {
++        big: bool,
++    },
++    Find {
++        find: Find,
++        target: char,
++        repeat: bool,
++    },
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Class {
++    Blank,
++    Word,
++    Punct,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct Snapshot {
++    text: String,
++    pos: usize,
++}
++
++/// The query as characters, the cursor as a character index.
++struct Line<'a> {
++    chars: Vec<char>,
++    pos: usize,
++    word_chars: &'a str,
++}
++
++impl Line<'_> {
++    fn len(&self) -> usize {
++        self.chars.len()
++    }
++
++    fn text(&self) -> String {
++        self.chars.iter().collect()
++    }
++
++    /// Normal mode: the cursor sits on a character, never past the last one.
++    fn clamp(&mut self) {
++        self.pos = self.pos.min(self.len().saturating_sub(1));
++    }
++
++    fn class(&self, i: usize, big: bool) -> Class {
++        let c = self.chars[i];
++        if c.is_whitespace() {
++            Class::Blank
++        } else if big || self.word_chars.contains(c) {
++            Class::Word
++        } else {
++            Class::Punct
++        }
++    }
++
++    fn blank(&self, i: usize) -> bool {
++        self.chars[i].is_whitespace()
++    }
++
++    fn first_non_blank(&self) -> usize {
++        (0..self.len()).find(|&i| !self.blank(i)).unwrap_or(self.len().saturating_sub(1))
++    }
++
++    /// The run of same-class characters around `i`, as `start..end`.
++    fn run(&self, i: usize, big: bool) -> (usize, usize) {
++        let class = self.class(i, big);
++        let mut start = i;
++        while start > 0 && self.class(start - 1, big) == class {
++            start -= 1;
++        }
++        let mut end = i + 1;
++        while end < self.len() && self.class(end, big) == class {
++            end += 1;
++        }
++        (start, end)
++    }
++
++    /// `w`: the start of the next word, or the line's end.
++    fn word_start(&self, mut i: usize, big: bool) -> usize {
++        let n = self.len();
++        if i >= n {
++            return n;
++        }
++        if !self.blank(i) {
++            i = self.run(i, big).1;
++        }
++        while i < n && self.blank(i) {
++            i += 1;
++        }
++        i
++    }
++
++    /// `b`: the start of this word, or of the previous one when already there.
++    fn word_back(&self, mut i: usize, big: bool) -> usize {
++        if i == 0 {
++            return 0;
++        }
++        i -= 1;
++        while i > 0 && self.blank(i) {
++            i -= 1;
++        }
++        if self.blank(i) {
++            i
++        } else {
++            self.run(i, big).0
++        }
++    }
++
++    /// `e`: the end of this word, or of the next one when already there.
++    fn word_end(&self, mut i: usize, big: bool) -> Option<usize> {
++        let n = self.len();
++        i += 1;
++        while i < n && self.blank(i) {
++            i += 1;
++        }
++        (i < n).then(|| self.run(i, big).1 - 1)
++    }
++
++    /// `ge`: the end of the previous word.
++    fn word_end_back(&self, i: usize, big: bool) -> Option<usize> {
++        let mut i = if self.blank(i) {
++            i
++        } else {
++            self.run(i, big).0.checked_sub(1)?
++        };
++        while self.blank(i) {
++            i = i.checked_sub(1)?;
++        }
++        Some(i)
++    }
++
++    /// `f F t T`: the `count`-th `target` from the cursor.
++    fn find(&self, find: Find, target: char, count: usize, repeat: bool) -> Option<usize> {
++        let at = |i: usize| self.chars[i] == target;
++        match find {
++            Find::Forward | Find::TillForward => {
++                // `;` after `t` skips the target right next to the cursor
++                let skip = usize::from(repeat && find == Find::TillForward);
++                let mut i = self.pos + skip;
++                for _ in 0..count {
++                    i = (i + 1..self.len()).find(|&j| at(j))?;
++                }
++                Some(if find == Find::TillForward {
++                    i - 1
++                } else {
++                    i
++                })
++            }
++            Find::Backward | Find::TillBackward => {
++                let skip = usize::from(repeat && find == Find::TillBackward);
++                let mut i = self.pos.checked_sub(skip)?;
++                for _ in 0..count {
++                    i = (0..i).rev().find(|&j| at(j))?;
++                }
++                Some(if find == Find::TillBackward {
++                    i + 1
++                } else {
++                    i
++                })
++            }
++        }
++    }
++
++    /// `iw aw iW aW`.
++    fn word_object(&self, inner: bool, big: bool) -> (usize, usize) {
++        let (start, end) = self.run(self.pos, big);
++        if inner {
++            return (start, end);
++        }
++        let n = self.len();
++        if self.blank(self.pos) {
++            // the blanks and the word after them
++            return (
++                start,
++                if end < n {
++                    self.run(end, big).1
++                } else {
++                    end
++                },
++            );
++        }
++        if end < n && self.blank(end) {
++            (start, self.run(end, big).1) // the word and the blanks after it
++        } else if start > 0 && self.blank(start - 1) {
++            (self.run(start - 1, big).0, end) // none after: the blanks before it
++        } else {
++            (start, end)
++        }
++    }
++
++    /// `i" a" i' a' i` a``: the quoted string the cursor is in or on, else the next one.
++    fn quote_object(&self, inner: bool, quote: char) -> Option<(usize, usize)> {
++        let quotes: Vec<usize> = (0..self.len())
++            .filter(|&i| self.chars[i] == quote && (i == 0 || self.chars[i - 1] != '\\'))
++            .collect();
++        let (open, close) = if let Some(k) = quotes.iter().position(|&i| i == self.pos) {
++            if k % 2 == 0 {
++                (quotes[k], *quotes.get(k + 1)?)
++            } else {
++                (quotes[k - 1], quotes[k])
++            }
++        } else {
++            let before = quotes.iter().filter(|&&i| i < self.pos).count();
++            if before % 2 == 1 {
++                (quotes[before - 1], *quotes.get(before)?)
++            } else {
++                (*quotes.get(before)?, *quotes.get(before + 1)?)
++            }
++        };
++        if inner {
++            return Some((open + 1, close));
++        }
++        // a": with the blanks after it, or before it when there are none after
++        let mut end = close + 1;
++        while end < self.len() && self.blank(end) {
++            end += 1;
++        }
++        let mut start = open;
++        if end == close + 1 {
++            while start > 0 && self.blank(start - 1) {
++                start -= 1;
++            }
++        }
++        Some((start, end))
++    }
++
++    /// `i( a( i[ a[ i{ a{ i< a<` (and `b` `B`): the innermost pair around the cursor.
++    fn pair_object(&self, inner: bool, open: char, close: char) -> Option<(usize, usize)> {
++        let start = if self.chars[self.pos] == open {
++            self.pos
++        } else {
++            let mut depth = 0usize;
++            let mut i = self.pos;
++            loop {
++                i = i.checked_sub(1)?;
++                if self.chars[i] == close {
++                    depth += 1;
++                } else if self.chars[i] == open {
++                    if depth == 0 {
++                        break i;
++                    }
++                    depth -= 1;
++                }
++            }
++        };
++        let mut depth = 0usize;
++        let end = (start + 1..self.len()).find(|&j| {
++            if self.chars[j] == open {
++                depth += 1;
++            } else if self.chars[j] == close {
++                if depth == 0 {
++                    return true;
++                }
++                depth -= 1;
++            }
++            false
++        })?;
++        Some(if inner {
++            (start + 1, end)
++        } else {
++            (start, end + 1)
++        })
++    }
++}
++
++/// Insert-mode Ctrl-W: delete back to the start of the word before the cursor, as `db` does
++/// (the word classes of normal mode; blanks before the cursor go with the word).
++pub fn delete_word_before(input: &mut Cursor, word_chars: &str) {
++    let line = Line {
++        chars: input.as_str().chars().collect(),
++        pos: input.substring().chars().count(),
++        word_chars,
++    };
++    let start = line.word_back(line.pos, false);
++    let mut chars = line.chars;
++    chars.drain(start..line.pos);
++    input.set(chars.into_iter().collect(), start);
++}
++
++#[derive(Default)]
++pub struct Vim {
++    count: Option<usize>,
++    op: Option<(Op, char)>,
++    op_count: Option<usize>,
++    wait: Wait,
++    /// The keys of the pending command, shown like vim's 'showcmd'.
++    keys: String,
++    last_find: Option<(Find, char)>,
++    /// The unnamed register: what `d c x s y` took, what `p P` put.
++    register: String,
++    undo: Vec<Snapshot>,
++    redo: Vec<Snapshot>,
++    /// Set by `u` and Ctrl-R, which manage the undo stacks themselves.
++    undoing: bool,
++}
++
++const MAX_COUNT: usize = 9999;
++const MAX_UNDO: usize = 100;
++
++impl Vim {
++    /// Whether a command is half-typed (it takes the next key, Esc cancels it).
++    pub fn pending(&self) -> bool {
++        !self.keys.is_empty()
++    }
++
++    /// The pending keys, for display.
++    pub fn showcmd(&self) -> &str {
++        &self.keys
++    }
++
++    /// Insert mode starts: everything typed until Esc is one undo step.
++    pub fn insert_started(&mut self, input: &Cursor) {
++        self.push_undo(Snapshot {
++            text: input.as_str().to_owned(),
++            pos: input.substring().chars().count(),
++        });
++    }
++
++    /// Insert mode ends: one that changed nothing leaves no undo step.
++    pub fn insert_ended(&mut self, input: &Cursor) {
++        if self.undo.last().is_some_and(|s| s.text == input.as_str()) {
++            self.undo.pop();
++        }
++    }
++
++    /// One key in normal mode.
++    pub fn feed(&mut self, key: &SingleKey, input: &mut Cursor, word_chars: &str) -> Step {
++        let mut line = Line {
++            chars: input.as_str().chars().collect(),
++            pos: input.substring().chars().count(),
++            word_chars,
++        };
++        line.clamp();
++        let before = Snapshot {
++            text: line.text(),
++            pos: line.pos,
++        };
++        self.undoing = false;
++        let step = self.key(key, &mut line);
++        let text = line.text();
++        if !self.undoing && (step == Step::Insert || text != before.text) {
++            self.push_undo(before);
++        }
++        if step != Step::Insert {
++            line.clamp();
++        }
++        input.set(text, line.pos);
++        step
++    }
++
++    fn push_undo(&mut self, snapshot: Snapshot) {
++        self.undo.push(snapshot);
++        if self.undo.len() > MAX_UNDO {
++            self.undo.remove(0);
++        }
++        self.redo.clear();
++    }
++
++    fn reset(&mut self) {
++        self.count = None;
++        self.op = None;
++        self.op_count = None;
++        self.wait = Wait::Command;
++        self.keys.clear();
++    }
++
++    /// Cancel the pending command (vim beeps).
++    fn cancel(&mut self) -> Step {
++        self.reset();
++        Step::Done
++    }
++
++    fn total(&self) -> usize {
++        self.count.unwrap_or(1).saturating_mul(self.op_count.unwrap_or(1)).min(MAX_COUNT)
++    }
++
++    fn pending_op(&self) -> Option<Op> {
++        self.op.map(|(op, _)| op)
++    }
++
++    #[allow(clippy::too_many_lines)]
++    fn key(&mut self, key: &SingleKey, line: &mut Line) -> Step {
++        let plain = !key.ctrl && !key.alt && !key.super_key;
++        let ch = match key.code {
++            KeyCodeValue::Char(c) if plain => Some(c),
++            KeyCodeValue::Space if plain => Some(' '),
++            _ => None,
++        };
++
++        // The argument of f F t T, r, a text object, g
++        match self.wait {
++            Wait::Command => {}
++            Wait::Target(find) => {
++                let Some(target) = ch else {
++                    return self.cancel();
++                };
++                self.last_find = Some((find, target));
++                return self.motion(
++                    Motion::Find {
++                        find,
++                        target,
++                        repeat: false,
++                    },
++                    line,
++                );
++            }
++            Wait::Replace => {
++                let Some(with) = ch else {
++                    return self.cancel();
++                };
++                return self.replace(with, line);
++            }
++            Wait::Object { inner } => {
++                let Some(object) = ch else {
++                    return self.cancel();
++                };
++                return self.object(inner, object, line);
++            }
++            Wait::G => {
++                return match ch {
++                    Some('g') if self.op.is_none() => {
++                        let count = self.count;
++                        self.reset();
++                        count.map_or(Step::Run(Action::ScrollToTop, 1), |n| Step::Row(n - 1))
++                    }
++                    Some('e') => self.motion(Motion::WordEndBack { big: false }, line),
++                    Some('E') => self.motion(Motion::WordEndBack { big: true }, line),
++                    _ => self.cancel(),
++                };
++            }
++        }
++
++        if key.ctrl && !key.alt && self.op.is_none() {
++            let n = self.total();
++            let step = match key.code {
++                KeyCodeValue::Char('r') => return self.redo(line),
++                KeyCodeValue::Char('u') => Step::Run(Action::ScrollHalfPageUp, n),
++                KeyCodeValue::Char('d') => Step::Run(Action::ScrollHalfPageDown, n),
++                KeyCodeValue::Char('b') => Step::Run(Action::ScrollPageUp, n),
++                KeyCodeValue::Char('f') => Step::Run(Action::ScrollPageDown, n),
++                KeyCodeValue::Char('n') => Step::Run(Action::SelectNext, n),
++                KeyCodeValue::Char('p') => Step::Run(Action::SelectPrevious, n),
++                _ => Step::Done,
++            };
++            self.reset();
++            return step;
++        }
++        match key.code {
++            KeyCodeValue::Left | KeyCodeValue::Backspace if plain => {
++                return self.motion(Motion::Left, line);
++            }
++            KeyCodeValue::Right if plain => return self.motion(Motion::Right, line),
++            KeyCodeValue::Home if plain => return self.motion(Motion::LineStart, line),
++            KeyCodeValue::End if plain => return self.motion(Motion::LineEnd, line),
++            _ => {}
++        }
++        let Some(c) = ch else {
++            return self.cancel();
++        };
++
++        // A count: 1-9 start it, 0 continues it (else 0 is a motion)
++        let typing_count = if self.op.is_some() {
++            self.op_count
++        } else {
++            self.count
++        };
++        if let Some(digit) = c.to_digit(10)
++            && (digit != 0 || typing_count.is_some())
++        {
++            let next = typing_count.unwrap_or(0).saturating_mul(10).saturating_add(digit as usize);
++            if self.op.is_some() {
++                self.op_count = Some(next.min(MAX_COUNT));
++            } else {
++                self.count = Some(next.min(MAX_COUNT));
++            }
++            self.keys.push(c);
++            return Step::Pending;
++        }
++
++        let motion = match c {
++            'h' => Some(Motion::Left),
++            'l' | ' ' => Some(Motion::Right),
++            '0' => Some(Motion::LineStart),
++            '^' => Some(Motion::FirstNonBlank),
++            '$' => Some(Motion::LineEnd),
++            '|' => Some(Motion::Column),
++            'w' => Some(Motion::WordStart { big: false }),
++            'W' => Some(Motion::WordStart { big: true }),
++            'b' => Some(Motion::WordBack { big: false }),
++            'B' => Some(Motion::WordBack { big: true }),
++            'e' => Some(Motion::WordEnd { big: false }),
++            'E' => Some(Motion::WordEnd { big: true }),
++            ';' | ',' => {
++                let Some((find, target)) = self.last_find else {
++                    return self.cancel();
++                };
++                let find = if c == ',' {
++                    find.reversed()
++                } else {
++                    find
++                };
++                Some(Motion::Find {
++                    find,
++                    target,
++                    repeat: true,
++                })
++            }
++            _ => None,
++        };
++        if let Some(motion) = motion {
++            return self.motion(motion, line);
++        }
++
++        let find = match c {
++            'f' => Some(Find::Forward),
++            'F' => Some(Find::Backward),
++            't' => Some(Find::TillForward),
++            'T' => Some(Find::TillBackward),
++            _ => None,
++        };
++        if let Some(find) = find {
++            self.wait = Wait::Target(find);
++            self.keys.push(c);
++            return Step::Pending;
++        }
++        if c == 'g' {
++            self.wait = Wait::G;
++            self.keys.push(c);
++            return Step::Pending;
++        }
++
++        if let Some((pending, pending_key)) = self.op {
++            // after an operator: the same key again (dd cc yy) or a text object
++            return match c {
++                _ if c == pending_key => {
++                    if pending == Op::Yank {
++                        // yy: the whole line; the cursor stays
++                        self.reset();
++                        self.register = line.text();
++                        return Step::Done;
++                    }
++                    let len = line.len();
++                    self.apply(pending, 0, len, line)
++                }
++                'i' | 'a' => {
++                    self.wait = Wait::Object { inner: c == 'i' };
++                    self.keys.push(c);
++                    Step::Pending
++                }
++                _ => self.cancel(),
++            };
++        }
++        let op = match c {
++            'd' => Some(Op::Delete),
++            'c' => Some(Op::Change),
++            'y' => Some(Op::Yank),
++            _ => None,
++        };
++        if let Some(op) = op {
++            self.op = Some((op, c));
++            self.keys.push(c);
++            return Step::Pending;
++        }
++
++        let n = self.total();
++        let has_count = self.count.is_some();
++        self.reset();
++        match c {
++            // shorthands: x = dl, X = dh, s = cl, D = d$, C = c$, Y = y$ (as in Neovim)
++            'x' | 'X' | 's' | 'D' | 'C' | 'Y' => {
++                let (op, motion) = match c {
++                    'x' => (Op::Delete, Motion::Right),
++                    'X' => (Op::Delete, Motion::Left),
++                    's' => (Op::Change, Motion::Right),
++                    'D' => (Op::Delete, Motion::LineEnd),
++                    'C' => (Op::Change, Motion::LineEnd),
++                    _ => (Op::Yank, Motion::LineEnd),
++                };
++                if c == 's' && line.len() == 0 {
++                    return Step::Insert;
++                }
++                self.op = Some((op, c));
++                self.count = Some(n);
++                self.motion(motion, line)
++            }
++            // S = cc
++            'S' => {
++                let len = line.len();
++                self.apply(Op::Change, 0, len, line)
++            }
++            'r' => {
++                self.count = Some(n);
++                self.wait = Wait::Replace;
++                self.keys.push(c);
++                Step::Pending
++            }
++            '~' => {
++                let end = (line.pos + n).min(line.len());
++                for c in &mut line.chars[line.pos..end] {
++                    *c = if c.is_lowercase() {
++                        c.to_uppercase().next().unwrap_or(*c)
++                    } else {
++                        c.to_lowercase().next().unwrap_or(*c)
++                    };
++                }
++                line.pos = end;
++                Step::Done
++            }
++            'p' | 'P' => {
++                if self.register.is_empty() {
++                    return Step::Done;
++                }
++                let text: Vec<char> = self.register.repeat(n).chars().collect();
++                let at = if c == 'p' && line.len() > 0 {
++                    line.pos + 1
++                } else {
++                    line.pos
++                };
++                let added = text.len();
++                line.chars.splice(at..at, text);
++                line.pos = at + added - 1;
++                Step::Done
++            }
++            'u' => self.undo(n, line),
++            'i' => Step::Insert,
++            'a' => {
++                line.pos = (line.pos + 1).min(line.len());
++                Step::Insert
++            }
++            'I' => {
++                line.pos = if line.len() == 0 {
++                    0
++                } else {
++                    line.first_non_blank()
++                };
++                Step::Insert
++            }
++            'A' => {
++                line.pos = line.len();
++                Step::Insert
++            }
++            // a new search: the query is cleared
++            '/' | '?' => {
++                line.chars.clear();
++                line.pos = 0;
++                Step::Insert
++            }
++            'j' => Step::Run(Action::SelectNext, n),
++            'k' => Step::Run(Action::SelectPrevious, n),
++            'G' if has_count => Step::Row(n - 1),
++            'G' => Step::Run(Action::ScrollToBottom, 1),
++            'H' => Step::Run(Action::ScrollToScreenTop, 1),
++            'M' => Step::Run(Action::ScrollToScreenMiddle, 1),
++            'L' => Step::Run(Action::ScrollToScreenBottom, 1),
++            _ => Step::Done,
++        }
++    }
++
++    /// Where a motion lands and whether an operator includes that character.
++    fn reach(&self, motion: Motion, line: &Line) -> Option<(usize, bool)> {
++        let n = self.total();
++        let len = line.len();
++        let pos = line.pos;
++        let op = self.pending_op();
++        let repeat = |mut at: usize, step: &dyn Fn(usize) -> Option<usize>| {
++            let mut moved = false;
++            for _ in 0..n {
++                match step(at) {
++                    Some(next) if next != at => {
++                        at = next;
++                        moved = true;
++                    }
++                    _ => break,
++                }
++            }
++            moved.then_some(at)
++        };
++        match motion {
++            Motion::Left => (pos > 0).then(|| (pos.saturating_sub(n), false)),
++            Motion::Right => {
++                // with an operator the motion may reach past the last character (x, dl)
++                let last = if op.is_some() {
++                    len
++                } else {
++                    len.saturating_sub(1)
++                };
++                let to = (pos + n).min(last);
++                (to > pos).then_some((to, false))
++            }
++            Motion::LineStart => Some((0, false)),
++            Motion::FirstNonBlank => Some((
++                if len == 0 {
++                    0
++                } else {
++                    line.first_non_blank()
++                },
++                false,
++            )),
++            Motion::LineEnd => {
++                if len == 0 {
++                    Some((0, false))
++                } else {
++                    Some((len - 1, true))
++                }
++            }
++            Motion::Column => {
++                Some(((self.count.unwrap_or(1) - 1).min(len.saturating_sub(1)), false))
++            }
++            Motion::WordStart { big } => {
++                if op == Some(Op::Change) && len > 0 && !line.blank(pos) {
++                    // cw changes to the end of the word, like ce (but stays in this word)
++                    let mut end = line.run(pos, big).1 - 1;
++                    for _ in 1..n {
++                        match line.word_end(end, big) {
++                            Some(next) => end = next,
++                            None => break,
++                        }
++                    }
++                    return Some((end, true));
++                }
++                let to = repeat(pos, &|i| Some(line.word_start(i, big)))?;
++                if op.is_some() {
++                    Some((to, false))
++                } else {
++                    Some((to.min(len.saturating_sub(1)), false))
++                }
++            }
++            Motion::WordBack { big } => {
++                repeat(pos, &|i| Some(line.word_back(i, big))).map(|to| (to, false))
++            }
++            Motion::WordEnd { big } => repeat(pos, &|i| line.word_end(i, big)).map(|to| (to, true)),
++            Motion::WordEndBack { big } => {
++                repeat(pos, &|i| line.word_end_back(i, big)).map(|to| (to, true))
++            }
++            Motion::Find {
++                find,
++                target,
++                repeat: again,
++            } => {
++                if len == 0 {
++                    return None;
++                }
++                let to = line.find(find, target, n, again)?;
++                Some((to, matches!(find, Find::Forward | Find::TillForward)))
++            }
++        }
++    }
++
++    fn motion(&mut self, motion: Motion, line: &mut Line) -> Step {
++        let reach = self.reach(motion, line);
++        let Some(op) = self.pending_op() else {
++            self.reset();
++            if let Some((to, _)) = reach {
++                line.pos = to;
++            }
++            return Step::Done;
++        };
++        let Some((to, inclusive)) = reach else {
++            return self.cancel();
++        };
++        let pos = line.pos;
++        let (start, end) = if to >= pos {
++            (
++                pos,
++                if inclusive {
++                    to + 1
++                } else {
++                    to
++                },
++            )
++        } else {
++            (
++                to,
++                if inclusive {
++                    pos + 1
++                } else {
++                    pos
++                },
++            )
++        };
++        let end = end.min(line.len());
++        self.apply(op, start, end, line)
++    }
++
++    fn object(&mut self, inner: bool, object: char, line: &mut Line) -> Step {
++        let Some(op) = self.pending_op() else {
++            return self.cancel();
++        };
++        if line.len() == 0 {
++            return self.cancel();
++        }
++        let range = match object {
++            'w' => Some(line.word_object(inner, false)),
++            'W' => Some(line.word_object(inner, true)),
++            '"' | '\'' | '`' => line.quote_object(inner, object),
++            '(' | ')' | 'b' => line.pair_object(inner, '(', ')'),
++            '[' | ']' => line.pair_object(inner, '[', ']'),
++            '{' | '}' | 'B' => line.pair_object(inner, '{', '}'),
++            '<' | '>' => line.pair_object(inner, '<', '>'),
++            _ => None,
++        };
++        let Some((start, end)) = range else {
++            return self.cancel();
++        };
++        self.apply(op, start, end, line)
++    }
++
++    fn apply(&mut self, op: Op, start: usize, end: usize, line: &mut Line) -> Step {
++        self.reset();
++        if start < end {
++            self.register = line.chars[start..end].iter().collect();
++        }
++        line.pos = start;
++        match op {
++            Op::Yank => Step::Done,
++            Op::Delete => {
++                line.chars.drain(start..end);
++                Step::Done
++            }
++            Op::Change => {
++                line.chars.drain(start..end);
++                Step::Insert
++            }
++        }
++    }
++
++    fn replace(&mut self, with: char, line: &mut Line) -> Step {
++        let n = self.total();
++        self.reset();
++        if line.pos + n > line.len() {
++            return Step::Done;
++        }
++        for c in &mut line.chars[line.pos..line.pos + n] {
++            *c = with;
++        }
++        line.pos += n - 1;
++        Step::Done
++    }
++
++    fn undo(&mut self, n: usize, line: &mut Line) -> Step {
++        self.undoing = true;
++        for _ in 0..n {
++            let Some(snapshot) = self.undo.pop() else {
++                break;
++            };
++            self.redo.push(Snapshot {
++                text: line.text(),
++                pos: line.pos,
++            });
++            line.chars = snapshot.text.chars().collect();
++            line.pos = snapshot.pos;
++        }
++        Step::Done
++    }
++
++    fn redo(&mut self, line: &mut Line) -> Step {
++        let n = self.total();
++        self.reset();
++        self.undoing = true;
++        for _ in 0..n {
++            let Some(snapshot) = self.redo.pop() else {
++                break;
++            };
++            self.undo.push(Snapshot {
++                text: line.text(),
++                pos: line.pos,
++            });
++            line.chars = snapshot.text.chars().collect();
++            line.pos = snapshot.pos;
++        }
++        Step::Done
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const WORD_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_\
++        абвгґдеєжзиіїйклмнопрстуфхцчшщьюяАБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ";
++
++    fn key(s: &str) -> SingleKey {
++        let (code, ctrl) = match s {
++            "esc" => (KeyCodeValue::Esc, false),
++            "ctrl-r" => (KeyCodeValue::Char('r'), true),
++            " " => (KeyCodeValue::Space, false),
++            _ => (KeyCodeValue::Char(s.chars().next().unwrap()), false),
++        };
++        SingleKey {
++            code,
++            ctrl,
++            alt: false,
++            shift: false,
++            super_key: false,
++        }
++    }
++
++    /// Run `keys` (one char each; `<esc>` and `<c-r>` spelled out) on `text` with the cursor at
++    /// the `|` in it; returns the text with `|` at the cursor, and the last step.
++    fn run(text: &str, keys: &str) -> (String, Step) {
++        let pos = text.find('|').unwrap();
++        let mut input = Cursor::from(String::new());
++        input.set(text.replace('|', ""), text[..pos].chars().count());
++        let mut vim = Vim::default();
++        let mut step = Step::Done;
++        let mut rest = keys;
++        while !rest.is_empty() {
++            let (k, len) = if rest.starts_with("<esc>") {
++                ("esc", 5)
++            } else if rest.starts_with("<c-r>") {
++                ("ctrl-r", 5)
++            } else {
++                let c = rest.chars().next().unwrap();
++                (&rest[..c.len_utf8()], c.len_utf8())
++            };
++            rest = &rest[len..];
++            step = if step == Step::Insert {
++                // typed in insert mode, until <esc>
++                if k == "esc" {
++                    input.left();
++                    vim.insert_ended(&input);
++                    Step::Done
++                } else {
++                    input.insert(k.chars().next().unwrap());
++                    Step::Insert
++                }
++            } else {
++                vim.feed(&key(k), &mut input, WORD_CHARS)
++            };
++        }
++        let mut out = input.as_str().to_owned();
++        out.insert(input.position(), '|');
++        (out, step)
++    }
++
++    fn text(text_with_cursor: &str, keys: &str) -> String {
++        run(text_with_cursor, keys).0
++    }
++
++    #[test]
++    fn motions() {
++        assert_eq!(text("git com|mit -am", "w"), "git commit |-am");
++        assert_eq!(text("git com|mit -am", "W"), "git commit |-am");
++        assert_eq!(text("git commit -a|m", "b"), "git commit -|am");
++        assert_eq!(text("git commit -a|m", "B"), "git commit |-am");
++        assert_eq!(text("g|it commit", "e"), "gi|t commit");
++        assert_eq!(text("gi|t commit", "e"), "git commi|t");
++        assert_eq!(text("git com|mit", "ge"), "gi|t commit");
++        assert_eq!(text("git com|mit", "0"), "|git commit");
++        assert_eq!(text("  git |x", "^"), "  |git x");
++        assert_eq!(text("g|it commit", "$"), "git commi|t");
++        assert_eq!(text("|a b c d", "3w"), "a b c |d");
++        assert_eq!(text("|a b c d", "9w"), "a b c |d"); // stops at the last character
++        assert_eq!(text("|abc", "5l"), "ab|c");
++        assert_eq!(text("ab|c", "h "), "ab|c"); // h, then space (= l)
++        assert_eq!(text("|abcdef", "4|"), "abc|def");
++        assert_eq!(text("echo пр|ивіт світ", "w"), "echo привіт |світ");
++    }
++
++    #[test]
++    fn finds() {
++        assert_eq!(text("|a-b-c-d", "f-"), "a|-b-c-d");
++        assert_eq!(text("|a-b-c-d", "2f-"), "a-b|-c-d");
++        assert_eq!(text("|a-b-c-d", "f-;"), "a-b|-c-d");
++        assert_eq!(text("|a-b-c-d", "f-;,"), "a|-b-c-d");
++        assert_eq!(text("|a-b-c-d", "t-"), "|a-b-c-d"); // the target is next: no move
++        assert_eq!(text("|a-b-c-d", "t-;"), "a-|b-c-d");
++        assert_eq!(text("a-bc|d", "F-"), "a|-bcd");
++        assert_eq!(text("a-bc|d", "T-"), "a-|bcd");
++        assert_eq!(text("a-b-c-|d", "T-"), "a-b-c-|d"); // the target is next: no move
++        assert_eq!(text("|abc", "fz"), "|abc"); // not found: stays
++        assert_eq!(text("|a-b-c", "df-"), "|b-c");
++        assert_eq!(text("|a-b-c", "dt-"), "|-b-c");
++        assert_eq!(text("a-b-|c", "dF-"), "a-b|c");
++        assert_eq!(text("a-b-|c", "dT-"), "a-b-|c");
++    }
++
++    #[test]
++    fn operators() {
++        assert_eq!(text("git |commit -am", "dw"), "git |-am");
++        assert_eq!(text("git |commit -am", "cwpush<esc>"), "git pus|h -am");
++        assert_eq!(text("git co|mmit -am", "cwx<esc>"), "git co|x -am");
++        assert_eq!(text("git |commit -am", "d$"), "git| ");
++        assert_eq!(text("git |commit -am", "D"), "git| ");
++        assert_eq!(text("git |commit -am", "d0"), "|commit -am");
++        assert_eq!(text("git |commit -am", "db"), "|commit -am");
++        assert_eq!(text("git commit |-am", "de"), "git commit| "); // "-" is a word of its own
++        assert_eq!(text("a |b c d", "2dw"), "a |d");
++        assert_eq!(text("a |b c d", "d2w"), "a |d");
++        assert_eq!(text("git |commit", "dd"), "|");
++        assert_eq!(text("git |commit", "ccls<esc>"), "l|s");
++        assert_eq!(text("git |commit", "Sls<esc>"), "l|s");
++        assert_eq!(text("git |commit", "Cx<esc>"), "git |x");
++        assert_eq!(text("ab|cd", "x"), "ab|d");
++        assert_eq!(text("ab|cd", "2x"), "a|b");
++        assert_eq!(text("abc|d", "3x"), "ab|c"); // x at the end: the cursor steps back
++        assert_eq!(text("ab|cd", "X"), "a|cd");
++        assert_eq!(text("ab|cd", "sZ<esc>"), "ab|Zd");
++        assert_eq!(text("git |commit", "dx"), "git |commit"); // unknown motion: cancelled
++        assert_eq!(text("git |commit", "d<esc>x"), "git |ommit"); // Esc cancels the operator
++        assert_eq!(text("|", "x"), "|");
++        assert_eq!(text("|", "sa<esc>"), "|a");
++    }
++
++    #[test]
++    fn text_objects() {
++        assert_eq!(text("git com|mit -am", "diw"), "git | -am");
++        assert_eq!(text("git com|mit -am", "daw"), "git |-am");
++        assert_eq!(text("git commit a|m", "daw"), "git commi|t"); // no blanks after: before
++        assert_eq!(text("git commit -a|m", "daw"), "git commit |-"); // "-" isn't a blank
++        assert_eq!(text("ls x/y|/z q", "ciWa<esc>"), "ls |a q");
++        assert_eq!(text("echo \"he|llo\" x", "di\""), "echo \"|\" x");
++        assert_eq!(text("echo \"he|llo\" x", "da\""), "echo |x");
++        assert_eq!(text("|echo 'a b' c", "ci'z<esc>"), "echo '|z' c"); // the next quotes
++        assert_eq!(text("f(a, (b|), c)", "di("), "f(a, (|), c)");
++        assert_eq!(text("f(a, (b), |c)", "dib"), "f(|)");
++        assert_eq!(text("f(a, (b), |c)", "da("), "|f"); // "f" stays; the cursor clamps
++        assert_eq!(text("x [a |b] y", "di]"), "x [|] y");
++        assert_eq!(text("${HO|ME}", "ci{X<esc>"), "${|X}");
++        assert_eq!(text("a |b", "di("), "a |b"); // not in parentheses: nothing
++    }
++
++    #[test]
++    fn replace_toggle_put() {
++        assert_eq!(text("ab|cd", "rX"), "ab|Xd");
++        assert_eq!(text("ab|cd", "2rX"), "abX|X");
++        assert_eq!(text("ab|cd", "3rX"), "ab|cd"); // not enough characters: nothing
++        assert_eq!(text("|abc", "~~"), "AB|c");
++        assert_eq!(text("|ПРИ", "3~"), "пр|и");
++        assert_eq!(text("|ab cd", "dwP"), "ab| cd");
++        assert_eq!(text("|ab cd", "dwp"), "cab| d");
++        assert_eq!(text("|ab", "yl2p"), "aa|ab");
++        assert_eq!(text("|ab cd", "yiwA <esc>p"), "ab cd a|b");
++        assert_eq!(text("|ab cd", "Y$p"), "ab cdab c|d");
++        assert_eq!(text("ab |cd", "yyP"), "ab ab c|dcd"); // yy keeps the cursor
++    }
++
++    #[test]
++    fn undo_redo() {
++        assert_eq!(text("git |commit", "dwu"), "git |commit");
++        assert_eq!(text("git |commit", "dwu<c-r>"), "git| ");
++        assert_eq!(text("a |b c", "dwdwuu"), "a |b c");
++        assert_eq!(text("a |b c", "dwdw2u"), "a |b c");
++        // an insert is one undo step, with the change that started it
++        assert_eq!(text("git |commit", "cwpush<esc>u"), "git |commit");
++        assert_eq!(text("git |commit", "Ax<esc>ay<esc>u"), "git commit|x");
++        // an insert that changed nothing is no step
++        assert_eq!(text("a |b", "xi<esc>u"), "a |b");
++        assert_eq!(text("|ab", "u"), "|ab");
++        // cursor moves aren't undone
++        assert_eq!(text("|ab cd", "xwu"), "|ab cd");
++    }
++
++    #[test]
++    fn counts_and_list_keys() {
++        assert_eq!(run("|a", "j").1, Step::Run(Action::SelectNext, 1));
++        assert_eq!(run("|a", "5j").1, Step::Run(Action::SelectNext, 5));
++        assert_eq!(run("|a", "12k").1, Step::Run(Action::SelectPrevious, 12));
++        assert_eq!(run("|a", "gg").1, Step::Run(Action::ScrollToTop, 1));
++        assert_eq!(run("|a", "3gg").1, Step::Row(2));
++        assert_eq!(run("|a", "G").1, Step::Run(Action::ScrollToBottom, 1));
++        assert_eq!(run("|a", "10G").1, Step::Row(9));
++        assert_eq!(run("|a", "2").1, Step::Pending);
++        assert_eq!(run("|a", "d").1, Step::Pending);
++        assert_eq!(run("|a", "dj").1, Step::Done); // no lines: cancelled
++        assert_eq!(text("a b |c", "/"), "|");
++        assert_eq!(run("a b |c", "/").1, Step::Insert);
++        assert_eq!(text("|abc", "A"), "abc|");
++        assert_eq!(text("a|bc", "a"), "ab|c");
++        assert_eq!(text("  a|bc", "I"), "  |abc");
++    }
++
++    #[test]
++    fn insert_ctrl_w() {
++        let ctrl_w = |text: &str| {
++            let mut input = Cursor::from(text.to_string());
++            input.end();
++            delete_word_before(&mut input, WORD_CHARS);
++            input.into_inner()
++        };
++        assert_eq!(ctrl_w("git commit -am"), "git commit -");
++        assert_eq!(ctrl_w("git commit -"), "git commit ");
++        assert_eq!(ctrl_w("git commit "), "git ");
++        assert_eq!(ctrl_w("echo привіт"), "echo ");
++        assert_eq!(ctrl_w(""), "");
++    }
++
++    #[test]
++    fn showcmd() {
++        let mut vim = Vim::default();
++        let mut input = Cursor::from("abc".to_string());
++        for k in ["2", "d", "i"] {
++            vim.feed(&key(k), &mut input, WORD_CHARS);
++        }
++        assert_eq!(vim.showcmd(), "2di");
++        assert!(vim.pending());
++        vim.feed(&key("esc"), &mut input, WORD_CHARS);
++        assert!(!vim.pending());
++        assert_eq!(input.as_str(), "abc");
++    }
++}
