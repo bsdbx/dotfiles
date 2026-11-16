@@ -1,0 +1,17 @@
+keys:
+  - &bohdan age1nmwdcnmdy0m7nxn0h4gyn9dqrnuaek9c9cza6pn54lzk4gchm9vs02hksc
+  - &hephaestus age1zuyecdl058wj3pkheeau2jmzprsj3gp2rzcxgrr2djexur6cm9zqxdl3q3
+  - &hephaestus-vm age1evlunfzg2ylkccql58rxpej92tt3j46n5gjxe859sx898c0wzdhqkl8x0n
+
+creation_rules:
+  - path_regex: ^secrets/vm\.yaml$
+    key_groups:
+      - age:
+          - *bohdan
+          - *hephaestus-vm
+
+  - path_regex: ^secrets/hephaestus\.yaml$
+    key_groups:
+      - age:
+          - *bohdan
+          - *hephaestus
