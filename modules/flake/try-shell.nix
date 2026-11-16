@@ -36,6 +36,7 @@
           cd "$sb"
           echo "Test shell: home is $sb (deleted on exit). Type 'exit' to leave."
           env -i HOME="$sb" USER="$USER" TERM="$TERM" LANG="''${LANG:-en_US.UTF-8}" \
+            TERMINFO="''${TERMINFO:-}" TERMINFO_DIRS="''${TERMINFO_DIRS:-}" \
             COLORTERM="''${COLORTERM:-}" NIX_PROFILES=${hm.home.path} \
             PATH=${hm.home.path}/bin:/usr/bin:/bin XDG_RUNTIME_DIR="$sb/rt" \
             ${lib.getExe hm.programs.zsh.package} -i || true
