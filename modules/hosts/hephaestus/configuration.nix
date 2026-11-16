@@ -20,6 +20,7 @@ in
       nixos.network
       nixos.sudo
       nixos.zsh
+      nixos.abbr
       nixos.bohdan
       nixos.vm
 

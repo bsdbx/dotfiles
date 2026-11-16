@@ -36,6 +36,7 @@ in
       completion
       atuin
       vi-mode
+      abbr
       prompt
     ];
 
